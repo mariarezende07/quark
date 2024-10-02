@@ -1,36 +1,20 @@
-import os
-import sys
+import math
+
 import numpy as np
-import random
 import torch
 import torch.nn as nn
 
-from .common import Conv, DWConv
-from cone_detection_python.utils.google_utils import attempt_download
-
-
-class CrossConv(nn.Module):
-    # Cross Convolution Downsample
-    def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
-        # ch_in, ch_out, kernel, stride, groups, expansion, shortcut
-        super(CrossConv, self).__init__()
-        c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, (1, k), (1, s))
-        self.cv2 = Conv(c_, c2, (k, 1), (s, 1), g=g)
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+from utils.downloads import attempt_download
 
 
 class Sum(nn.Module):
     # Weighted sum of 2 or more layers https://arxiv.org/abs/1911.09070
     def __init__(self, n, weight=False):  # n: number of inputs
-        super(Sum, self).__init__()
+        super().__init__()
         self.weight = weight  # apply weights boolean
         self.iter = range(n - 1)  # iter object
         if weight:
-            self.w = nn.Parameter(-torch.arange(1., n) / 2, requires_grad=True)  # layer weights
+            self.w = nn.Parameter(-torch.arange(1.0, n) / 2, requires_grad=True)  # layer weights
 
     def forward(self, x):
         y = x[0]  # no weight
@@ -45,45 +29,41 @@ class Sum(nn.Module):
 
 
 class MixConv2d(nn.Module):
-    # Mixed Depthwise Conv https://arxiv.org/abs/1907.09595
-    def __init__(self, c1, c2, k=(1, 3), s=1, equal_ch=True):
-        super(MixConv2d, self).__init__()
-        groups = len(k)
+    # Mixed Depth-wise Conv https://arxiv.org/abs/1907.09595
+    def __init__(self, c1, c2, k=(1, 3), s=1, equal_ch=True):  # ch_in, ch_out, kernel, stride, ch_strategy
+        super().__init__()
+        n = len(k)  # number of convolutions
         if equal_ch:  # equal c_ per group
-            i = torch.linspace(0, groups - 1E-6, c2).floor()  # c2 indices
-            c_ = [(i == g).sum() for g in range(groups)]  # intermediate channels
+            i = torch.linspace(0, n - 1E-6, c2).floor()  # c2 indices
+            c_ = [(i == g).sum() for g in range(n)]  # intermediate channels
         else:  # equal weight.numel() per group
-            b = [c2] + [0] * groups
-            a = np.eye(groups + 1, groups, k=-1)
+            b = [c2] + [0] * n
+            a = np.eye(n + 1, n, k=-1)
             a -= np.roll(a, 1, axis=1)
             a *= np.array(k) ** 2
             a[0] = 1
             c_ = np.linalg.lstsq(a, b, rcond=None)[0].round()  # solve for equal weight indices, ax = b
 
-        self.m = nn.ModuleList([nn.Conv2d(c1, int(c_[g]), k[g], s, k[g] // 2, bias=False) for g in range(groups)])
+        self.m = nn.ModuleList([
+            nn.Conv2d(c1, int(c_), k, s, k // 2, groups=math.gcd(c1, int(c_)), bias=False) for k, c_ in zip(k, c_)])
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.LeakyReLU(0.1, inplace=True)
+        self.act = nn.SiLU()
 
     def forward(self, x):
-        return x + self.act(self.bn(torch.cat([m(x) for m in self.m], 1)))
+        return self.act(self.bn(torch.cat([m(x) for m in self.m], 1)))
 
 
 class Ensemble(nn.ModuleList):
     # Ensemble of models
     def __init__(self):
-        super(Ensemble, self).__init__()
+        super().__init__()
 
-    def forward(self, x, augment=False):
-        y = []
-        for module in self:
-            y.append(module(x, augment)[0])
+    def forward(self, x, augment=False, profile=False, visualize=False):
+        y = [module(x, augment, profile, visualize)[0] for module in self]
         # y = torch.stack(y).max(0)[0]  # max ensemble
         # y = torch.stack(y).mean(0)  # mean ensemble
         y = torch.cat(y, 1)  # nms ensemble
         return y, None  # inference, train output
-
-
-
 
 
 class ORT_NMS(torch.autograd.Function):
@@ -125,6 +105,7 @@ class TRT_NMS(torch.autograd.Function):
         score_activation=0,
         score_threshold=0.25,
     ):
+
         batch_size, num_boxes, num_classes = scores.shape
         num_det = torch.randint(0, max_output_boxes, (batch_size, 1), dtype=torch.int32)
         det_boxes = torch.randn(batch_size, max_output_boxes, 4)
@@ -173,26 +154,32 @@ class ONNX_ORT(nn.Module):
         self.n_classes=n_classes
 
     def forward(self, x):
-        boxes = x[:, :, :4]
-        conf = x[:, :, 4:5]
-        scores = x[:, :, 5:]
-        if self.n_classes == 1:
-            scores = conf # for models with one class, cls_loss is 0 and cls_conf is always 0.5,
-                                 # so there is no need to multiplicate.
-        else:
-            scores *= conf  # conf = obj_conf * cls_conf
-        boxes @= self.convert_matrix
+        ## https://github.com/thaitc-hust/yolov9-tensorrt/blob/main/torch2onnx.py
+        ## thanks https://github.com/thaitc-hust
+        if isinstance(x, list):  ## yolov9-c.pt and yolov9-e.pt return list
+            x = x[1]
+        x = x.permute(0, 2, 1)
+        bboxes_x = x[..., 0:1]
+        bboxes_y = x[..., 1:2]
+        bboxes_w = x[..., 2:3]
+        bboxes_h = x[..., 3:4]
+        bboxes = torch.cat([bboxes_x, bboxes_y, bboxes_w, bboxes_h], dim = -1)
+        bboxes = bboxes.unsqueeze(2) # [n_batch, n_bboxes, 4] -> [n_batch, n_bboxes, 1, 4]
+        obj_conf = x[..., 4:]
+        scores = obj_conf
+        bboxes @= self.convert_matrix
         max_score, category_id = scores.max(2, keepdim=True)
         dis = category_id.float() * self.max_wh
-        nmsbox = boxes + dis
+        nmsbox = bboxes + dis
         max_score_tp = max_score.transpose(1, 2).contiguous()
         selected_indices = ORT_NMS.apply(nmsbox, max_score_tp, self.max_obj, self.iou_threshold, self.score_threshold)
         X, Y = selected_indices[:, 0], selected_indices[:, 2]
-        selected_boxes = boxes[X, Y, :]
+        selected_boxes = bboxes[X, Y, :]
         selected_categories = category_id[X, Y, :].float()
         selected_scores = max_score[X, Y, :]
         X = X.unsqueeze(1).float()
         return torch.cat([X, selected_boxes, selected_categories, selected_scores], 1)
+
 
 class ONNX_TRT(nn.Module):
     '''onnx module with TensorRT NMS operation.'''
@@ -210,20 +197,24 @@ class ONNX_TRT(nn.Module):
         self.n_classes=n_classes
 
     def forward(self, x):
-        boxes = x[:, :, :4]
-        conf = x[:, :, 4:5]
-        scores = x[:, :, 5:]
-        if self.n_classes == 1:
-            scores = conf # for models with one class, cls_loss is 0 and cls_conf is always 0.5,
-                                 # so there is no need to multiplicate.
-        else:
-            scores *= conf  # conf = obj_conf * cls_conf
-        num_det, det_boxes, det_scores, det_classes = TRT_NMS.apply(boxes, scores, self.background_class, self.box_coding,
+        ## https://github.com/thaitc-hust/yolov9-tensorrt/blob/main/torch2onnx.py
+        ## thanks https://github.com/thaitc-hust
+        if isinstance(x, list):  ## yolov9-c.pt and yolov9-e.pt return list
+            x = x[1]
+        x = x.permute(0, 2, 1)
+        bboxes_x = x[..., 0:1]
+        bboxes_y = x[..., 1:2]
+        bboxes_w = x[..., 2:3]
+        bboxes_h = x[..., 3:4]
+        bboxes = torch.cat([bboxes_x, bboxes_y, bboxes_w, bboxes_h], dim = -1)
+        bboxes = bboxes.unsqueeze(2) # [n_batch, n_bboxes, 4] -> [n_batch, n_bboxes, 1, 4]
+        obj_conf = x[..., 4:]
+        scores = obj_conf
+        num_det, det_boxes, det_scores, det_classes = TRT_NMS.apply(bboxes, scores, self.background_class, self.box_coding,
                                                                     self.iou_threshold, self.max_obj,
                                                                     self.plugin_version, self.score_activation,
                                                                     self.score_threshold)
         return num_det, det_boxes, det_scores, det_classes
-
 
 class End2End(nn.Module):
     '''export onnx or tensorrt model with NMS operation.'''
@@ -243,37 +234,42 @@ class End2End(nn.Module):
         return x
 
 
-
-
-
-def attempt_load(weights, map_location=None):
+def attempt_load(weights, device=None, inplace=True, fuse=True):
     # Loads an ensemble of models weights=[a,b,c] or a single model weights=[a] or weights=a
+    from models.yolo import Detect, Model
+
     model = Ensemble()
-
-    # Pass the path to the folder with models folder, required to load .pt file
-    # sys.path.insert(0, '/home/tocoquinho/repositories/ros2_ws/src/quark_driver/perception/cone_detection_python/cone_detection_python')
-    sys.path.insert(0, '/home/quark/main_ws/src/quark_driver/perception/cone_detection_python/cone_detection_python')
-
     for w in weights if isinstance(weights, list) else [weights]:
-        #attempt_download(w)
-        ckpt = torch.load(w, map_location=map_location)  # load
-        model.append(ckpt['ema' if ckpt.get('ema') else 'model'].float().fuse().eval())  # FP32 model
-    
-    # Compatibility updates
+        ckpt = torch.load(attempt_download(w), map_location='cpu')  # load
+        ckpt = (ckpt.get('ema') or ckpt['model']).to(device).float()  # FP32 model
+
+        # Model compatibility updates
+        if not hasattr(ckpt, 'stride'):
+            ckpt.stride = torch.tensor([32.])
+        if hasattr(ckpt, 'names') and isinstance(ckpt.names, (list, tuple)):
+            ckpt.names = dict(enumerate(ckpt.names))  # convert to dict
+
+        model.append(ckpt.fuse().eval() if fuse and hasattr(ckpt, 'fuse') else ckpt.eval())  # model in eval mode
+
+    # Module compatibility updates
     for m in model.modules():
-        if type(m) in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU]:
-            m.inplace = True  # pytorch 1.7.0 compatibility
-        elif type(m) is nn.Upsample:
+        t = type(m)
+        if t in (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU, Detect, Model):
+            m.inplace = inplace  # torch 1.7.0 compatibility
+            # if t is Detect and not isinstance(m.anchor_grid, list):
+            #    delattr(m, 'anchor_grid')
+            #    setattr(m, 'anchor_grid', [torch.zeros(1)] * m.nl)
+        elif t is nn.Upsample and not hasattr(m, 'recompute_scale_factor'):
             m.recompute_scale_factor = None  # torch 1.11.0 compatibility
-        elif type(m) is Conv:
-            m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatibility
-    
+
+    # Return model
     if len(model) == 1:
-        return model[-1]  # return model
-    else:
-        print('Ensemble created with %s\n' % weights)
-        for k in ['names', 'stride']:
-            setattr(model, k, getattr(model[-1], k))
-        return model  # return ensemble
+        return model[-1]
 
-
+    # Return detection ensemble
+    print(f'Ensemble created with {weights}\n')
+    for k in 'names', 'nc', 'yaml':
+        setattr(model, k, getattr(model[0], k))
+    model.stride = model[torch.argmax(torch.tensor([m.stride.max() for m in model])).int()].stride  # max stride
+    assert all(model[0].nc == m.nc for m in model), f'Models have different class counts: {[m.nc for m in model]}'
+    return model

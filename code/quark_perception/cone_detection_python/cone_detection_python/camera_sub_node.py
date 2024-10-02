@@ -1,6 +1,6 @@
 import cv2
 import rclpy
-from .yolov7 import Yolov7
+from yolov9 import Yolov9
 from rclpy.node import Node
 from cv_bridge import CvBridge
 
@@ -20,15 +20,14 @@ class ImageSubscriber(Node):
         self.detections_pub = self.create_publisher(Image, '/camera/detections', 1)
         self.cone_centers_pub = self.create_publisher(PoseArray, '/camera/cone_centers', 1)
         
-        #self.yolov7 = Yolov7("/home/tocoquinho/repositories/ros2_ws/src/quark_driver/perception/cone_detection_python/params/tiny_cone_weights.pt", 0.4, 0.25, 480, None)
-        self.yolov7 = Yolov7("/home/quark/Documents/yolov7/400_epochs_tiny.pt", 0.6, 0.5, 1280, None)
+        self.yolov9 = Yolov9("/home/quark/Documents/yolov9/400_epochs_tiny.pt", 0.6, 0.5, 1280, None)
         print("Ready to receive")
 
     def image_callback(self, msg):
 
         cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         
-        display_img, predictions = self.yolov7.detect([cv_image])
+        display_img, predictions = self.yolov9.detect([cv_image])
         predictions.sort(key=lambda x: x[1]) #sort by precision
 
         centers = PoseArray()
